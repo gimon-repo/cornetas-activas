@@ -89,9 +89,25 @@ public class MainActivity extends Activity {
         toggle.requestFocus();
     }
 
+    /** Actualiza el estado en pantalla (activo / en descanso) cada 2 s mientras la app está abierta. */
+    private final Runnable ticker = new Runnable() {
+        @Override public void run() {
+            refresh();
+            status.postDelayed(this, 2000);
+        }
+    };
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        status.removeCallbacks(ticker);
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
+        status.removeCallbacks(ticker);
+        status.postDelayed(ticker, 2000);
         refresh();
         // Al abrir la app se piden, uno por uno, los permisos que falten.
         askNextPermission(false);
@@ -164,8 +180,11 @@ public class MainActivity extends Activity {
     }
 
     private void refresh(boolean on) {
-        status.setText(on ? "● ACTIVO: las cornetas reciben señal" : "○ Detenido");
-        status.setTextColor(on ? 0xFF66BB6A : 0xFFEF5350);
+        boolean rest = on && KeepAliveService.resting;
+        status.setText(!on ? "○ Detenido"
+                : rest ? "◐ EN DESCANSO: no hay cornetas Bluetooth conectadas"
+                : "● ACTIVO: las cornetas reciben señal");
+        status.setTextColor(!on ? 0xFFEF5350 : rest ? 0xFFFFCA28 : 0xFF66BB6A);
         toggle.setText(on ? "Detener" : "Activar");
         int md = Prefs.mode(MainActivity.this);
         boolean pulse = md != Prefs.MODE_CONTINUOUS;

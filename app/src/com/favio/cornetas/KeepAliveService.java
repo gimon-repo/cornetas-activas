@@ -39,6 +39,8 @@ public class KeepAliveService extends Service {
     private static final double MAX_AMPLITUDE = 0.5;
 
     static volatile boolean running;
+    /** true cuando no hay cornetas Bluetooth conectadas y la app no envía audio. */
+    static volatile boolean resting;
 
     private volatile boolean stopRequested;
     private volatile boolean restartTrack;
@@ -50,6 +52,9 @@ public class KeepAliveService extends Service {
 
     private Thread audioThread;
     private PowerManager.WakeLock wakeLock;
+    private AudioManager audioManager;
+    private final Object btLock = new Object();
+    private Object deviceCallback;
 
     /** Al despertar la pantalla se recrea la pista, por si el enrutamiento Bluetooth cambió. */
     private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
@@ -81,6 +86,34 @@ public class KeepAliveService extends Service {
         } else {
             registerReceiver(screenReceiver, f);
         }
+        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (Build.VERSION.SDK_INT >= 23) {
+            // Avisa al instante cuando las cornetas se conectan o desconectan.
+            android.media.AudioDeviceCallback cb = new android.media.AudioDeviceCallback() {
+                @Override public void onAudioDevicesAdded(AudioDeviceInfo[] added) { wakeAudioThread(); }
+                @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) { wakeAudioThread(); }
+            };
+            audioManager.registerAudioDeviceCallback(cb, null);
+            deviceCallback = cb;
+        }
+    }
+
+    private void wakeAudioThread() {
+        synchronized (btLock) {
+            btLock.notifyAll();
+        }
+    }
+
+    /** true si hay una salida de audio Bluetooth (A2DP o LE Audio) conectada. No pide permisos. */
+    @SuppressWarnings("deprecation")
+    static boolean bluetoothSpeakerConnected(AudioManager am) {
+        if (Build.VERSION.SDK_INT < 23) return am.isBluetoothA2dpOn();
+        for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+            int t = d.getType();
+            // 8 = A2DP, 26/27/30 = LE Audio (auriculares, parlante, broadcast)
+            if (t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || t == 26 || t == 27 || t == 30) return true;
+        }
+        return false;
     }
 
     @Override
@@ -102,7 +135,7 @@ public class KeepAliveService extends Service {
             audioThread.start();
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "cornetas:audio");
-            wakeLock.acquire();
+            wakeLock.setReferenceCounted(false);
         }
         running = true;
         return START_STICKY;
@@ -117,6 +150,21 @@ public class KeepAliveService extends Service {
     }
 
     private void goForeground() {
+        Notification n = buildNotification(resting);
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        } else {
+            startForeground(NOTIFICATION_ID, n);
+        }
+    }
+
+    private void updateNotification(boolean rest) {
+        if (stopRequested) return;
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.notify(NOTIFICATION_ID, buildNotification(rest));
+    }
+
+    private Notification buildNotification(boolean rest) {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         Notification.Builder b;
         if (Build.VERSION.SDK_INT >= 26) {
@@ -132,18 +180,14 @@ public class KeepAliveService extends Service {
                 this, 0, new Intent(this, MainActivity.class), piFlags);
         PendingIntent stop = PendingIntent.getService(
                 this, 1, new Intent(this, KeepAliveService.class).setAction(ACTION_STOP), piFlags);
-        Notification n = b.setSmallIcon(android.R.drawable.ic_media_play)
-                .setContentTitle("Cornetas activas")
-                .setContentText("Manteniendo las cornetas Bluetooth encendidas")
+        return b.setSmallIcon(rest ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play)
+                .setContentTitle(rest ? "Cornetas activas: en descanso" : "Cornetas activas")
+                .setContentText(rest ? "Esperando a que se conecten las cornetas Bluetooth"
+                        : "Manteniendo las cornetas Bluetooth encendidas")
                 .setContentIntent(open)
                 .addAction(android.R.drawable.ic_media_pause, "Detener", stop)
                 .setOngoing(true)
                 .build();
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-        } else {
-            startForeground(NOTIFICATION_ID, n);
-        }
     }
 
     private static AudioTrack createTrack() {
@@ -200,6 +244,32 @@ public class KeepAliveService extends Service {
         AudioTrack track = null;
         while (!stopRequested) {
             try {
+                if (!bluetoothSpeakerConnected(audioManager)) {
+                    // Sin cornetas: no se envía nada (tampoco suena por la TV) y se espera.
+                    if (!resting) {
+                        resting = true;
+                        if (track != null) {
+                            try { track.stop(); } catch (RuntimeException ignored) { }
+                            track.release();
+                            track = null;
+                        }
+                        if (wakeLock != null) wakeLock.release();
+                        updateNotification(true);
+                    }
+                    synchronized (btLock) {
+                        btLock.wait(30_000); // se despierta antes si cambia un dispositivo de audio
+                    }
+                    continue;
+                }
+                if (resting || (wakeLock != null && !wakeLock.isHeld())) {
+                    resting = false;
+                    if (wakeLock != null) wakeLock.acquire();
+                    updateNotification(false);
+                    // Pequeña espera para que el enlace Bluetooth termine de establecerse.
+                    Thread.sleep(1500);
+                    restartTrack = true;
+                    amp = 0;
+                }
                 if (track == null || restartTrack) {
                     restartTrack = false;
                     if (track != null) track.release();
@@ -268,6 +338,10 @@ public class KeepAliveService extends Service {
             audioThread = null;
         }
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        resting = false;
+        if (Build.VERSION.SDK_INT >= 23 && deviceCallback != null) {
+            audioManager.unregisterAudioDeviceCallback((android.media.AudioDeviceCallback) deviceCallback);
+        }
         if (!Prefs.enabled(this)) Watchdog.cancel(this);
         try { unregisterReceiver(screenReceiver); } catch (RuntimeException ignored) { }
         super.onDestroy();

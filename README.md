@@ -6,6 +6,8 @@ Combina varias técnicas a la vez:
 - Envía un tono muy grave (mezcla de 30 y 50 Hz) a bajo nivel, que no se oye.
 - En modo Combinado, cada pocos minutos refuerza ese tono 4 veces (+12 dB) durante 3 segundos.
 - Compensa el volumen: si bajas el volumen de la TV, la app sube su señal para que llegue igual a las cornetas.
+- Modo descanso: si no hay cornetas Bluetooth conectadas, deja de enviar audio (tampoco suena por la TV)
+  y vuelve sola en cuanto se conectan.
 Se mezcla con el audio de otras apps.
 
 ## Instalar en la TV (con la app Downloader)
